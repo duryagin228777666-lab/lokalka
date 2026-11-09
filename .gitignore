@@ -1,0 +1,10 @@
+# личное: ключи, память, решения, переносимый Python
+config.json
+config.json.tmp
+brain.json
+brain.json.tmp
+workspace/
+python/
+
+__pycache__/
+*.pyc
