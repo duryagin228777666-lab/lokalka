@@ -3,14 +3,29 @@ from __future__ import annotations
 
 import getpass
 import os
+import shutil
 import sys
+import threading
 import time
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 RESET = "\033[0m"
-COLORS = {"dim": "\033[2m", "red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m",
-          "cyan": "\033[36m", "bold": "\033[1m"}
+ERASE_LINE = "\r\033[K"
+# Мягкая палитра из 256 цветов: одинаково выглядит в PyCharm, cmd и обычных терминалах.
+COLORS = {"dim": "\033[38;5;245m", "red": "\033[38;5;203m", "green": "\033[38;5;114m",
+          "yellow": "\033[38;5;221m", "cyan": "\033[38;5;80m", "accent": "\033[38;5;141m",
+          "title": "\033[1;38;5;141m", "bold": "\033[1m"}
+# Значки есть в стандартных шрифтах Windows; запасной набор — для консолей без юникода.
+UNICODE_GLYPHS = {"bar": "▌", "prompt": "›", "tool": "→", "gutter": "│", "answer": "●", "error": "×",
+                  "spin": ("●∙∙", "∙●∙", "∙∙●", "∙●∙")}
+ASCII_GLYPHS = {"bar": "|", "prompt": ">", "tool": "->", "gutter": "|", "answer": "*", "error": "x",
+                "spin": ("*..", ".*.", "..*", ".*.")}
 THINKING_LABEL = "думаю..."
+SPIN_INTERVAL_SECONDS = 0.15
+DEFAULT_WIDTH = 80
+HELP_COMMAND_COLUMN = 17
+ANSWER_INDENT = "  "
+BOM = "﻿"
 PASTE_SETTLE_SECONDS = 0.03
 OUTPUT_PREVIEW_LINES = 20
 SUMMARY_CHARS = 100
@@ -73,12 +88,55 @@ def _input_pending() -> bool:
         return False
 
 
+def _pick_glyphs() -> Dict[str, Any]:
+    encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+    sample = "".join("".join(value) for value in UNICODE_GLYPHS.values())
+    try:
+        sample.encode(encoding)
+    except (UnicodeError, LookupError):
+        return ASCII_GLYPHS
+    return UNICODE_GLYPHS
+
+
+class _Spinner:
+    """Бегущий индикатор ожидания со счётчиком секунд; рисуется в отдельном потоке."""
+
+    def __init__(self, frames: Tuple[str, ...], paint: Any) -> None:
+        self._frames = frames
+        self._paint = paint
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        started = time.time()
+        step = 0
+        while True:
+            label = "{} {}с".format(THINKING_LABEL, int(time.time() - started))
+            frame = self._frames[step % len(self._frames)]
+            sys.stdout.write(ERASE_LINE + self._paint(frame, "accent") + " " + self._paint(label, "dim"))
+            sys.stdout.flush()
+            step += 1
+            if self._stop.wait(SPIN_INTERVAL_SECONDS):
+                return
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join()
+        sys.stdout.write(ERASE_LINE)
+        sys.stdout.flush()
+
+
 class Console:
     def __init__(self, auto_approve: bool = False) -> None:
         self.auto_approve = auto_approve
         self._color = _supports_color()
         self._interactive = sys.stdout.isatty()
+        self._glyphs = _pick_glyphs()
         self._waiting = False
+        self._spinner = None  # type: Optional[_Spinner]
+        self._answer_open = False
+        self._indent_due = False
         self._last_piece = ""
 
     # ------------------------------------------------------------ вывод
@@ -94,7 +152,34 @@ class Console:
         self.out(self.paint(clean(text), "yellow"))
 
     def error(self, text: str) -> None:
-        self.out(self.paint("Ошибка: " + clean(text), "red"))
+        self.out(self.paint("{} Ошибка: {}".format(self._glyphs["error"], clean(text)), "red"))
+
+    def _gutter(self) -> str:
+        return "  " + self.paint(self._glyphs["gutter"], "dim") + " "
+
+    def banner(self, version: str, provider: str, model: str, root: str) -> None:
+        """Шапка при запуске: название, подключение и рабочая папка."""
+        bar = "  " + self.paint(self._glyphs["bar"], "accent") + " "
+        room = max(shutil.get_terminal_size((DEFAULT_WIDTH, 24)).columns - 5, 20)
+        if len(root) > room:
+            root = "..." + root[-(room - 3):]
+        self.out()
+        self.out(bar + self.paint("Локалка", "title") + self.paint(" " + version, "dim"))
+        self.out(bar + "{} · {}".format(clean(provider), clean(model))[:room])
+        self.out(bar + self.paint(clean(root), "dim"))
+        self.out()
+        self.out("  " + self.paint("/help", "accent") + self.paint(" — команды  ·  ", "dim") +
+                 self.paint("/exit", "accent") + self.paint(" — выход", "dim"))
+
+    def help(self, text: str) -> None:
+        """Справка: колонка с командами выделяется цветом."""
+        for line in text.splitlines():
+            if line.startswith("  "):
+                line = self.paint(line[:HELP_COMMAND_COLUMN], "accent") + line[HELP_COMMAND_COLUMN:]
+            self.out(line)
+
+    def prompt(self) -> str:
+        return "\n" + self.paint(self._glyphs["prompt"], "title") + " "
 
     def plain(self, text: str) -> None:
         """Вывести текст из внешнего источника (вывод команды и т.п.)."""
@@ -102,13 +187,22 @@ class Console:
 
     def stream_start(self) -> None:
         self._last_piece = ""
+        self._answer_open = False
+        self._indent_due = False
         self._waiting = self._interactive
-        if self._waiting:
-            self.out(self.paint(THINKING_LABEL, "dim"), end="")
+        if self._waiting and self._color:
+            self._spinner = _Spinner(self._glyphs["spin"], self.paint)
+        elif self._waiting:
+            self.out(THINKING_LABEL, end="")
 
     def _clear_waiting(self) -> None:
-        if self._waiting:
-            self._waiting = False
+        if not self._waiting:
+            return
+        self._waiting = False
+        if self._spinner is not None:
+            self._spinner.stop()
+            self._spinner = None
+        else:
             self.out("\r" + " " * len(THINKING_LABEL) + "\r", end="")
 
     def stream_text(self, piece: str) -> None:
@@ -117,6 +211,17 @@ class Console:
             return
         self._clear_waiting()
         self._last_piece = piece
+        if self._interactive:  # в терминале ответ идёт с отметкой и отступом; в файл — как есть
+            if not self._answer_open:
+                self._answer_open = True
+                self.out(self.paint(self._glyphs["answer"], "accent") + " ", end="")
+            # Отступ после последнего перевода строки откладываем до следующего куска текста.
+            ends_line = piece.endswith("\n")
+            body = (piece[:-1] if ends_line else piece).replace("\n", "\n" + ANSWER_INDENT)
+            if self._indent_due and body:
+                body = ANSWER_INDENT + body
+            self._indent_due = ends_line
+            piece = body + ("\n" if ends_line else "")
         self.out(piece, end="")
 
     def stream_end(self) -> None:
@@ -128,22 +233,24 @@ class Console:
         value = clean(str(args.get(SUMMARY_KEYS.get(name, ""), ""))).replace("\n", " ")
         if len(value) > SUMMARY_CHARS:
             value = value[:SUMMARY_CHARS] + "..."
-        self.out(self.paint("  > {} {}".format(clean(name), value).rstrip(), "cyan"))
+        head = "  " + self.paint("{} {}".format(self._glyphs["tool"], clean(name)), "accent")
+        self.out((head + " " + self.paint(value, "dim")) if value else head)
 
     def tool_result(self, result: str) -> None:
         lines = clean(result).splitlines() or [""]
         if result.startswith("ERROR:"):
-            self.out(self.paint("    " + lines[0], "red"))
+            self.out(self._gutter() + self.paint(lines[0], "red"))
         elif lines[-1].startswith(("[exit code", "[stopped")):  # вывод запущенной команды
             shown = lines[:OUTPUT_PREVIEW_LINES]
             if len(lines) > OUTPUT_PREVIEW_LINES:
                 shown.append("... (ещё {} строк)".format(len(lines) - OUTPUT_PREVIEW_LINES))
-            self.out(self.paint("\n".join("    " + line for line in shown), "dim"))
+            for line in shown:
+                self.out(self._gutter() + self.paint(line, "dim"))
 
     def show_diff(self, detail: str) -> None:
         for line in clean(detail).splitlines():
             color = "green" if line.startswith("+") else "red" if line.startswith("-") else "dim"
-            self.out("    " + self.paint(line, color))
+            self.out(self._gutter() + self.paint(line, color))
 
     # ------------------------------------------------------------ ввод
 
@@ -157,7 +264,9 @@ class Console:
 
     def read_input(self, prompt: str) -> str:
         """Одна реплика пользователя. Вставленный многострочный текст склеивается в одну."""
-        lines = [input(prompt)]
+        # Метка кодировки (BOM) приходит при вставке и передаче текста из PowerShell — она
+        # невидима, но иначе «/команда» не распознаётся и уходит модели как обычный текст.
+        lines = [input(prompt).lstrip(BOM)]
         while _input_pending():
             try:
                 lines.append(input())
@@ -185,11 +294,11 @@ class Console:
             return True, ""
         # Действие показываем целиком, без обрезки: разрешение даётся на то, что видно.
         for line in clean(title).splitlines():
-            self.out("    " + self.paint(line, "yellow"))
+            self.out(self._gutter() + self.paint(line, "yellow"))
         if detail:
             self.show_diff(detail)
-        question = "    Разрешить? [y — да / n — нет] " if always_ask \
-            else "    Разрешить? [Enter — да / n — нет / a — да, и больше не спрашивать] "
+        question = "  ? Разрешить? [y — да / n — нет] " if always_ask \
+            else "  ? Разрешить? [Enter — да / n — нет / a — да, и больше не спрашивать] "
         try:
             answer = input(self.paint(question, "yellow")).strip()
         except EOFError:

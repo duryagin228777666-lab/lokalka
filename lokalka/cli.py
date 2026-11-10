@@ -6,7 +6,7 @@ import os
 import sys
 from typing import Any, Callable, Dict, List, Optional
 
-from . import __version__, shell, wizard
+from . import __version__, shell, usb, wizard
 from .agent import Agent
 from .config import (APP_DIR, ConfigError, load_config, resolve, save_config, validate_base_url,
                      with_provider)
@@ -29,6 +29,7 @@ HELP_TEXT = """\
   /undo          отменить последнюю правку файла
   /clear         начать новый диалог (забыть историю)
   /cd папка      сменить рабочую папку
+  /usb           работать на флешке: найду её сам и спрошу, всё ли верно (/флешка)
   /paste         многострочный ввод (конец — строка с одной точкой)
   !команда       выполнить команду в терминале самому
   /exit          выход
@@ -63,15 +64,12 @@ class Session:
                           "/auto": self._auto, "/undo": self._undo, "/clear": self._clear,
                           "/new": self._clear, "/cd": self._cd, "/paste": self._paste,
                           "/brain": self._brain, "/forget": self._forget,
+                          "/usb": self._usb, "/флешка": self._usb,
                           }  # type: Dict[str, Callable[[str], None]]
 
     def banner(self) -> None:
         settings = self.agent.settings
-        paint = self.console.paint
-        self.console.out(paint("Локалка {}".format(__version__), "bold") +
-                         "  ·  {}  ·  {}".format(settings["id"], settings["model"]))
-        self.console.out(paint("Папка: {}".format(self.agent.workspace.root), "dim"))
-        self.console.out(paint("/help — команды, /exit — выход", "dim"))
+        self.console.banner(__version__, settings["id"], settings["model"], self.agent.workspace.root)
 
     def _apply(self, cfg: Dict[str, Any]) -> None:
         self.agent.settings = resolve(cfg)
@@ -81,7 +79,7 @@ class Session:
     # ------------------------------------------------------------ команды
 
     def _help(self, _: str) -> None:
-        self.console.out(HELP_TEXT)
+        self.console.help(HELP_TEXT)
 
     def _model(self, argument: str) -> None:
         if argument:
@@ -137,6 +135,17 @@ class Session:
         target = os.path.abspath(os.path.join(self.agent.workspace.root, os.path.expanduser(argument.strip('"'))))
         if not os.path.isdir(target):
             raise ConfigError("Папка не найдена: {}".format(target))
+        self._switch(target)
+
+    def _usb(self, _: str) -> None:
+        target = usb.choose(usb.find_drives(), self.console.ask, self.console.out)
+        if not target:
+            self.console.out("Рабочая папка не изменилась: {}".format(self.agent.workspace.root))
+            return
+        os.makedirs(target, exist_ok=True)
+        self._switch(target)
+
+    def _switch(self, target: str) -> None:
         self.agent.workspace = Workspace(target, self.console.confirm, self.agent.workspace.brain)
         self.agent.reset()
         self.console.out("Рабочая папка: {} (диалог начат заново)".format(self.agent.workspace.root))
@@ -179,7 +188,7 @@ class Session:
     def loop(self) -> None:
         while True:
             try:
-                text = self.console.read_input(self.console.paint("\n> ", "green")).strip()
+                text = self.console.read_input(self.console.prompt()).strip()
             except EOFError:
                 return
             except KeyboardInterrupt:
@@ -195,6 +204,7 @@ def parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     parser.add_argument("--provider", help="провайдер на этот запуск (openrouter, openai, anthropic, ...)")
     parser.add_argument("--model", help="модель на этот запуск")
     parser.add_argument("--cwd", help="рабочая папка (по умолчанию — текущая)")
+    parser.add_argument("--usb", action="store_true", help="сразу предложить работать на флешке")
     parser.add_argument("--auto", action="store_true", help="не спрашивать разрешения на правки и команды")
     parser.add_argument("--version", action="version", version="lokalka " + __version__)
     return parser.parse_args(argv)
@@ -228,5 +238,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.prompt:
         return 0 if session.agent.send(args.prompt) else 1
     session.banner()
+    if args.usb:
+        session.handle("/usb")
     session.loop()
     return 0

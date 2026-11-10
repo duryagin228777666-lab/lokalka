@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -15,6 +16,10 @@ RETRY_STATUSES = (429, 500, 502, 503, 529)
 RETRY_DELAYS = (2, 6)
 ERROR_BODY_LIMIT = 4000
 ERROR_TEXT_LIMIT = 400
+
+# Windows подгружает корневые сертификаты по требованию браузера; Python так не умеет.
+CERT_HINT = ("Не удалось проверить сертификат {host}. Открой https://{host} один раз в браузере "
+             "на этом компьютере (Windows сама подгрузит сертификат) и повтори запрос.")
 
 STATUS_HINTS = {
     400: "запрос отклонён (часто — неверное имя модели)",
@@ -97,6 +102,8 @@ def _open(url: str, headers: Dict[str, str], payload: Optional[Dict[str, Any]]) 
                 continue
             raise _http_error(err)
         except urllib.error.URLError as err:
+            if isinstance(err.reason, ssl.SSLCertVerificationError):
+                raise ApiError(CERT_HINT.format(host=host))
             raise ApiError("Нет связи с {}: {}".format(host, err.reason))
         except (OSError, ValueError, http.client.HTTPException) as err:
             raise ApiError("Сбой соединения с {}: {}".format(host, err))
